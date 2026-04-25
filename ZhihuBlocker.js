@@ -1,154 +1,180 @@
 // ==UserScript==
-// @name         知乎屏蔽指定归属地并可选自动拉黑用户（带日志面板）
+// @name         知乎净化 Pro（黑名单 + UI面板 + 导入导出）
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  屏蔽来自指定IP归属地的回答和评论，并可选择是否自动将对应用户加入知乎黑名单，带拉黑日志查看功能。
-// @author       MeAliYeYe
+// @version      2.0
+// @description  关键词/IP过滤 + 本地用户黑名单 + UI配置面板 + 导入导出
+// @author        MeAliYeYe
 // @match        https://www.zhihu.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
-// @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
-(function() {
-    'use strict';
+(function () {
+  'use strict';
 
-    //---------------- 屏蔽归属地 ----------------
-    function getBlockedIPs() {
-        return GM_getValue("blocked_ip_locations", []);
-    }
+  //---------------- 数据 ----------------
+  const store = {
+    get: (k, d) => GM_getValue(k, d),
+    set: (k, v) => GM_setValue(k, v)
+  };
 
-    function editBlockedIPs() {
-        let now = getBlockedIPs().join("|");
-        let input = prompt("编辑 [屏蔽IP归属地]\n（用 | 分隔，例如：北京|上海|美国）", now);
-        if (input === "") {
-            GM_setValue("blocked_ip_locations", []);
-        } else if (input != null) {
-            GM_setValue("blocked_ip_locations", input.split("|"));
-        }
-    }
-
-    //---------------- 自动拉黑开关 ----------------
-    function toggleAutoBlock() {
-        let enabled = GM_getValue("auto_block_enabled", false);
-        GM_setValue("auto_block_enabled", !enabled);
-        alert("自动拉黑功能已 " + (!enabled ? "开启" : "关闭"));
-    }
-
-    //---------------- 拉黑日志 ----------------
-    function addBlockedLog(userName, userUrl) {
-        let logs = GM_getValue("blocked_users", []);
-        // 避免重复
-        if (logs.some(l => l.url === userUrl)) return;
-
-        logs.push({
-            name: userName || "未知用户",
-            url: userUrl,
-            time: new Date().toLocaleString()
-        });
-        GM_setValue("blocked_users", logs);
-    }
-
-    function viewBlockedLogs() {
-        let logs = GM_getValue("blocked_users", []);
-        if (!logs.length) {
-            alert("暂无已拉黑用户记录。");
-            return;
-        }
-
-        let msg = logs.map((l, i) =>
-            `${i+1}. ${l.name}\n${l.url}\n时间: ${l.time}`
-        ).join("\n\n");
-
-        alert("已拉黑用户列表：\n\n" + msg);
-    }
-
-    GM_registerMenuCommand("编辑屏蔽IP归属地", editBlockedIPs);
-    GM_registerMenuCommand("切换自动拉黑功能", toggleAutoBlock);
-    GM_registerMenuCommand("查看已拉黑用户日志", viewBlockedLogs);
-
-    //---------------- 拉黑请求 ----------------
-    function blockUser(userUrl, userName) {
-        if (!userUrl) return;
-
-        // 提取 user_slug
-        let match = userUrl.match(/people\/([^/?]+)/);
-        if (!match) return;
-        let userSlug = match[1];
-
-        // 从 cookie 里取 xsrf
-        let xsrf = document.cookie.match(/_xsrf=([^;]+)/);
-        if (!xsrf) return;
-
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: `https://www.zhihu.com/api/v4/members/${userSlug}/actions/block`,
-            headers: {
-                "Content-Type": "application/json",
-                "x-xsrf-token": decodeURIComponent(xsrf[1])
-            },
-            data: "{}",
-            onload: function(res) {
-                if (res.status === 200) {
-                    console.log("✅ 已将用户拉黑:", userSlug);
-                    addBlockedLog(userName, userUrl);
-                } else {
-                    console.warn("❌ 拉黑失败:", res.status, res.responseText);
-                }
-            }
-        });
-    }
-
-    //---------------- 内容过滤 ----------------
-    function filterIP(node) {
-        if (!node) return;
-        let blocked = getBlockedIPs();
-        if (!blocked.length) return;
-
-        let ipNode = node.querySelector(".css-ntkn7q");
-        if (ipNode) {
-            let text = ipNode.textContent.trim();
-            for (let keyword of blocked) {
-                if (keyword && text.includes(keyword)) {
-                    node.style.display = "none";
-
-                    // 检查是否启用自动拉黑
-                    if (GM_getValue("auto_block_enabled", false)) {
-                        let userLink = node.querySelector("a.UserLink-link");
-                        let userName = node.querySelector(".UserLink-link")?.textContent.trim() || "未知用户";
-                        if (userLink) {
-                            blockUser(userLink.href, userName);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    //---------------- 页面扫描 ----------------
-    function scanAll() {
-        document.querySelectorAll(
-            '.List-item, .Card, .CommentItemV2, .ContentItem, .css-140jo2, .CommentTopMeta'
-        ).forEach(node => filterIP(node));
-    }
-
-    const observer = new MutationObserver(mutations => {
-        for (let mutation of mutations) {
-            for (let target of mutation.addedNodes) {
-                if (target.nodeType === 1) {
-                    filterIP(target);
-                    target.querySelectorAll &&
-                        target.querySelectorAll(
-                            '.List-item, .Card, .CommentItemV2, .ContentItem, .css-140jo2, .CommentTopMeta'
-                        ).forEach(node => filterIP(node));
-                }
-            }
-        }
+  function getConfig() {
+    return store.get("config", {
+      ips: "",
+      keywords: "",
+      keywordOn: true,
+      ipOn: true,
+      userBlacklist: []
     });
+  }
 
-    observer.observe(document, { childList: true, subtree: true });
+  function saveConfig(cfg) {
+    store.set("config", cfg);
+  }
 
-    scanAll();
+  //---------------- UI 面板 ----------------
+  function createPanel() {
+    if (document.getElementById("zhihu-filter-panel")) return;
+
+    const panel = document.createElement("div");
+    panel.id = "zhihu-filter-panel";
+    panel.innerHTML = `
+    <div style="position:fixed;top:80px;right:20px;width:320px;background:#fff;border:1px solid #ccc;padding:10px;z-index:99999;font-size:12px;">
+      <h3>知乎净化 Pro</h3>
+      <label>IP规则</label>
+      <input id="zf-ip" style="width:100%" />
+      <label>关键词（正则）</label>
+      <input id="zf-kw" style="width:100%" />
+      <br><br>
+      <label><input type="checkbox" id="zf-ip-on"> 启用IP过滤</label><br>
+      <label><input type="checkbox" id="zf-kw-on"> 启用关键词过滤</label>
+      <br><br>
+      <button id="zf-save">保存</button>
+      <button id="zf-export">导出</button>
+      <button id="zf-import">导入</button>
+      <hr>
+      <button id="zf-close">关闭</button>
+    </div>`;
+
+    document.body.appendChild(panel);
+
+    const cfg = getConfig();
+
+    document.getElementById("zf-ip").value = cfg.ips;
+    document.getElementById("zf-kw").value = cfg.keywords;
+    document.getElementById("zf-ip-on").checked = cfg.ipOn;
+    document.getElementById("zf-kw-on").checked = cfg.keywordOn;
+
+    document.getElementById("zf-save").onclick = () => {
+      cfg.ips = document.getElementById("zf-ip").value;
+      cfg.keywords = document.getElementById("zf-kw").value;
+      cfg.ipOn = document.getElementById("zf-ip-on").checked;
+      cfg.keywordOn = document.getElementById("zf-kw-on").checked;
+      saveConfig(cfg);
+      alert("已保存");
+    };
+
+    document.getElementById("zf-export").onclick = () => {
+      prompt("复制配置", JSON.stringify(cfg));
+    };
+
+    document.getElementById("zf-import").onclick = () => {
+      let data = prompt("粘贴配置JSON");
+      try {
+        let obj = JSON.parse(data);
+        saveConfig(obj);
+        alert("导入成功，刷新页面");
+      } catch (e) {
+        alert("格式错误");
+      }
+    };
+
+    document.getElementById("zf-close").onclick = () => panel.remove();
+  }
+
+  GM_registerMenuCommand("打开控制面板", createPanel);
+
+  //---------------- 黑名单 ----------------
+  function isBlacklisted(url) {
+    const cfg = getConfig();
+    return cfg.userBlacklist.includes(url);
+  }
+
+  function addBlacklist(url) {
+    const cfg = getConfig();
+    if (!cfg.userBlacklist.includes(url)) {
+      cfg.userBlacklist.push(url);
+      saveConfig(cfg);
+    }
+  }
+
+  //---------------- 工具 ----------------
+  function matchReg(text, regStr) {
+    if (!regStr) return false;
+    try {
+      return new RegExp(regStr, "ig").test(text);
+    } catch {
+      return false;
+    }
+  }
+
+  function hide(node) {
+    node.style.display = "none";
+  }
+
+  //---------------- 过滤 ----------------
+  function filter(node) {
+    if (!node || node.dataset.filtered) return;
+    node.dataset.filtered = 1;
+
+    const cfg = getConfig();
+
+    const userLink = node.querySelector("a.UserLink-link");
+    const userUrl = userLink?.href;
+
+    // 黑名单
+    if (userUrl && isBlacklisted(userUrl)) {
+      hide(node);
+      return;
+    }
+
+    // 关键词
+    if (cfg.keywordOn) {
+      const text = node.innerText || "";
+      if (matchReg(text, cfg.keywords)) {
+        hide(node);
+        if (userUrl) addBlacklist(userUrl);
+        return;
+      }
+    }
+
+    // IP
+    if (cfg.ipOn) {
+      const ipNode = node.querySelector(".css-ntkn7q");
+      if (ipNode && matchReg(ipNode.innerText, cfg.ips)) {
+        hide(node);
+        if (userUrl) addBlacklist(userUrl);
+        return;
+      }
+    }
+  }
+
+  //---------------- 监听 ----------------
+  function scan() {
+    document.querySelectorAll('.List-item,.Card,.CommentItemV2,.ContentItem').forEach(filter);
+  }
+
+  const ob = new MutationObserver(m => {
+    m.forEach(r => r.addedNodes.forEach(n => {
+      if (n.nodeType === 1) {
+        filter(n);
+        n.querySelectorAll && n.querySelectorAll('.List-item,.Card,.CommentItemV2,.ContentItem').forEach(filter);
+      }
+    }));
+  });
+
+  ob.observe(document, { childList: true, subtree: true });
+
+  scan();
 })();
